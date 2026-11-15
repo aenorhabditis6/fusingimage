@@ -12,8 +12,9 @@ const luma = (r, g, b) => 0.299 * r + 0.587 * g + 0.114 * b;
 
 const isMobile = matchMedia('(max-width: 820px)').matches || /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
 const LIM = isMobile
-  ? { prevBg: 1100, fullBg: 2400, prevCh: 760, fullCh: 2000 }
-  : { prevBg: 1500, fullBg: 3200, prevCh: 1000, fullCh: 2800 };
+  ? { prevBg: 1100, fullBg: 2400, prevCh: 760, fullCh: 2000, animBg: 5e6, animCh: 4e6, gif: 720 }
+  : { prevBg: 1500, fullBg: 3200, prevCh: 1000, fullCh: 2800, animBg: 14e6, animCh: 10e6, gif: 960 };
+const MAX_FRAMES = 300;
 
 function mk(w, h) {
   const c = document.createElement('canvas');
@@ -185,7 +186,7 @@ const DEF = {
   chBright: 0, chContrast: 0, chSat: 0, chTemp: 0,
   cut: false, cutTol: 18, border: false, borderTol: 22, borderWidth: 14, choke: 0,
   // blend
-  matchLuma: 55, matchTint: 50, matchSat: 25, wrap: 45, wrapWidth: 35, feetFg: 0, haze: 0,
+  blendAmt: 50, matchLuma: 55, matchTint: 50, matchSat: 25, wrap: 45, wrapWidth: 35, feetFg: 0, haze: 0,
   // light
   lightPreset: 'auto', lightColor: '#ffd9a0', lightColorAuto: true,
   intensity: 100, lz: -30, range: 60, rim: 60, rimWidth: 30, dark: 35, shadowTint: 50, lightTint: 40,
@@ -228,6 +229,7 @@ const S = {
   lightSrc: 'auto',
   xf: { x: 0.5, y: 0.6, flip: false },
   view: 'blend', compare: false, pick: false,
+  t: 0, playing: true, exporting: false,   // animation clock (ms)
 };
 
 function mkBgLevel(c) {
@@ -250,7 +252,7 @@ function mkBgLevel(c) {
   };
 }
 function mkLevel(c) {
-  return { canvas: c, w: c.width, h: c.height, data: readData(c).data, A: null, body: null, rim: null, rimKey: null, out: null };
+  return { canvas: c, w: c.width, h: c.height, data: readData(c).data, body: null, rim: null, rimKey: null };
 }
 
 // ---------------------------------------------------------------- cutout & cleanup
@@ -367,19 +369,27 @@ function choke(img, px) {
   }
   for (let i = 0; i < n; i++) d[i * 4 + 3] = Math.min(d[i * 4 + 3], a[i]);
 }
-function cropToAlpha(img) {
+// Bounding box of visible pixels, optionally grown to include `box`.
+function alphaBox(img, box) {
   const { width: w, height: h, data: d } = img;
-  let x0 = w, y0 = h, x1 = -1, y1 = -1;
+  let [x0, y0, x1, y1] = box || [w, h, -1, -1];
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
     if (d[(y * w + x) * 4 + 3] > 10) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
   }
-  if (x1 < 0) return null;
-  const pad = 2;
+  return [x0, y0, x1, y1];
+}
+function cropCanvas(img, box) {
+  const { width: w, height: h } = img, pad = 2;
+  let [x0, y0, x1, y1] = box;
   x0 = Math.max(0, x0 - pad); y0 = Math.max(0, y0 - pad); x1 = Math.min(w - 1, x1 + pad); y1 = Math.min(h - 1, y1 + pad);
   const src = mk(w, h); g2(src).putImageData(img, 0, 0);
   const c = mk(x1 - x0 + 1, y1 - y0 + 1);
   g2(c).drawImage(src, -x0, -y0);
   return c;
+}
+function cropToAlpha(img) {
+  const box = alphaBox(img);
+  return box[2] < 0 ? null : cropCanvas(img, box);
 }
 function opaqueFraction(d) {
   let opaque = 0, cnt = 0;
@@ -473,12 +483,9 @@ function detectLight() {
 // ---------------------------------------------------------------- geometry of the character
 function ensureGeom(lv) {
   const { w, h } = lv, n = w * h;
-  if (!lv.A) {
-    const A = new Float32Array(n), d = lv.data;
-    for (let i = 0; i < n; i++) A[i] = d[i * 4 + 3] / 255;
-    lv.A = A;
-  }
-  const A = lv.A;
+  if (lv.body && lv.rimKey === P.rimWidth) return;
+  const A = new Float32Array(n), d = lv.data;
+  for (let i = 0; i < n; i++) A[i] = d[i * 4 + 3] / 255;
   if (!lv.body) {
     // "Inflated" pseudo-normals from a wide blur of the silhouette.
     const s = Math.max(2, 0.055 * h), B = gaussish(A, w, h, s), k = 2.5 * s;
@@ -626,11 +633,12 @@ function getGradeLUT() {
 // ---------------------------------------------------------------- character shading
 function lightPosComp(W, H) { return { x: S.light.x * W, y: S.light.y * H }; }
 
+const scratch = { out: null, fx: null };
 function processChar(lv, T, W, H) {
   ensureGeom(lv);
   const { w, h, data: d } = lv;
-  if (!lv.out || lv.out.width !== w) { lv.out = new ImageData(w, h); lv.fx = new ImageData(w, h); }
-  const o = lv.out.data, fx = lv.fx.data;
+  if (!scratch.out || scratch.out.width !== w || scratch.out.height !== h) { scratch.out = new ImageData(w, h); scratch.fx = new ImageData(w, h); }
+  const o = scratch.out.data, fx = scratch.fx.data;
   const lut = getCharLUT(), C = [0, 0, 0];
   const bs = bgStats();
   const Lc = lightPosComp(W, H), Ll = T.toLocal(Lc.x, Lc.y);
@@ -679,12 +687,12 @@ function processChar(lv, T, W, H) {
     }
   }
   const pc = tmp('charProc', w, h);
-  g2(pc).putImageData(lv.out, 0, 0);
+  g2(pc).putImageData(scratch.out, 0, 0);
   // rim + highlight wash: a light-coloured layer screened on top later
   const lc = lightCol.map(v => Math.round(v * 255));
   for (let j = 0; j < fx.length; j += 4) { fx[j] = lc[0]; fx[j + 1] = lc[1]; fx[j + 2] = lc[2]; }
   const fc = tmp('charFx', w, h);
-  g2(fc).putImageData(lv.fx, 0, 0);
+  g2(fc).putImageData(scratch.fx, 0, 0);
   return { base: pc, fx: fc };
 }
 
@@ -727,7 +735,7 @@ function silhouette(name, layer, fill) {
 }
 
 function render(full) {
-  const bgL = full ? S.bg.full : S.bg.prev;
+  const bgL = bgLevelAt(full);
   const W = bgL.w, H = bgL.h, diag = Math.hypot(W, H);
   const comp = tmp(full ? 'compFull' : 'comp', W, H), c = g2(comp);
   c.drawImage(bgL.canvas, 0, 0);
@@ -736,7 +744,7 @@ function render(full) {
   const Lc = lightPosComp(W, H);
 
   if (S.ch) {
-    const lv = full ? ensureFullLevel() : S.ch.prev;
+    const lv = chLevelAt(full);
     const T = charXf(lv, W, H);
     if (view === 'sticker') {
       T.apply(c); c.drawImage(lv.canvas, 0, 0); c.setTransform(1, 0, 0, 1, 0, 0);
@@ -962,24 +970,71 @@ function inspectView(comp) {
   cx.putImageData(id, 0, 0);
 }
 
+// ---------------------------------------------------------------- animation timeline
+function mkTimeline(delays) {
+  const starts = []; let t = 0;
+  for (const d of delays) { starts.push(t); t += d; }
+  return { delays, starts, dur: t };
+}
+function idxAt(tl, t) {
+  if (!tl) return 0;
+  t = ((t % tl.dur) + tl.dur) % tl.dur;
+  let lo = 0, hi = tl.starts.length - 1;
+  while (lo < hi) { const m = (lo + hi + 1) >> 1; if (tl.starts[m] <= t) lo = m; else hi = m - 1; }
+  return lo;
+}
+const isAnim = () => !!((S.bg && S.bg.tl) || (S.ch && S.ch.tl));
+function bgLevelAt(full) {
+  if (S.bg.tl) return S.bg.frames[idxAt(S.bg.tl, S.t)];
+  return full ? S.bg.full : S.bg.prev;
+}
+function chLevelAt(full) {
+  if (S.ch.tl) return S.ch.frames[idxAt(S.ch.tl, S.t)];
+  return full ? ensureFullLevel() : S.ch.prev;
+}
+// Output timeline for export: union of both loops' frame starts over the longer loop.
+function exportTimes() {
+  const tls = [S.bg && S.bg.tl, S.ch && S.ch.tl].filter(Boolean);
+  const dur = Math.min(20000, Math.max(...tls.map(t => t.dur)));
+  const set = new Set([0]);
+  for (const tl of tls) for (let base = 0; base < dur; base += tl.dur) for (const st of tl.starts) if (base + st < dur) set.add(base + st);
+  let ts = [...set].sort((a, b) => a - b);
+  if (ts.length > MAX_FRAMES) { const k = Math.ceil(ts.length / MAX_FRAMES); ts = ts.filter((_, i) => i % k === 0); }
+  return { ts, dur };
+}
+
 // ---------------------------------------------------------------- loading
 let idSeq = 1;
-function setBackground(img) {
-  const full = toCanvas(img, LIM.fullBg), prev = toCanvas(full, LIM.prevBg), small = toCanvas(prev, 256);
-  S.bg = { id: idSeq++, full: mkBgLevel(full), prev: mkBgLevel(prev), small: { w: small.width, h: small.height, data: readData(small).data } };
+function setBackground(img, anim) {
+  let full, prev, frames = null, tl = null;
+  if (anim) {
+    frames = anim.canvases.map(mkBgLevel);
+    full = prev = frames[0];
+    tl = mkTimeline(anim.delays);
+  } else {
+    const fc = toCanvas(img, LIM.fullBg);
+    full = mkBgLevel(fc); prev = mkBgLevel(toCanvas(fc, LIM.prevBg));
+  }
+  const small = toCanvas(prev.canvas, 256);
+  S.bg = { id: idSeq++, full, prev, frames, tl, small: { w: small.width, h: small.height, data: readData(small).data } };
   bgStatsCache.key = '';
   $('#thumbBg').src = small.toDataURL();
   autoLight(true);
   layoutFrame();
-  updateExportNote();
+  animChanged();
   schedule();
 }
 
 function setCharacter(img, opts = {}) {
-  const c = toCanvas(img, LIM.fullCh);
-  const data = readData(c);
+  let data, w, h;
+  if (opts.anim) {
+    data = opts.anim.frames[0]; w = data.width; h = data.height;
+  } else {
+    const c = toCanvas(img, LIM.fullCh);
+    data = readData(c); w = c.width; h = c.height;
+  }
   const opaque = opaqueFraction(data.data) > 0.985;
-  S.ch = { id: idSeq++, origData: data, w: c.width, h: c.height };
+  S.ch = { id: idSeq++, origData: data, w, h, anim: opts.anim || null, tl: opts.anim ? mkTimeline(opts.anim.delays) : null };
   P.cut = opaque; P.border = false; P.choke = 0;
   if (!rebuildChar()) return;
   if (!opts.keepPos) {
@@ -989,22 +1044,36 @@ function setCharacter(img, opts = {}) {
     S.xf = { x: 0.5, y: clamp(0.96 - P.size / 200, 0.2, 0.9), flip: false };
   }
   $('#thumbCh').src = toCanvas(S.ch.prev.canvas, 112).toDataURL();
-  if (opaque && !opts.quiet) toast('这张人物图没有透明底，已自动抠掉纯色底。不满意可以到「人物」页调「抠底容差」。');
+  if (opaque && !opts.quiet) toast('这张人物图没有透明底，已自动抠掉纯色底。不满意可以到「人物」页调「抠底容差」（高级选项里）。');
+  animChanged();
   syncUI();
   schedule();
 }
 
-function rebuildChar() {
-  const o = S.ch.origData;
+function cleanChar(o) {
   const img = new ImageData(new Uint8ClampedArray(o.data), o.width, o.height);
   if (P.cut) cutoutBorder(img, P.cutTol);
   if (P.border) removeOutline(img, P.borderTol, Math.max(2, Math.round(P.borderWidth / 1000 * Math.max(o.width, o.height))));
   if (P.choke > 0) choke(img, P.choke);
-  const full = cropToAlpha(img);
-  if (!full) { toast('抠完什么都不剩了，把容差调小一点'); return false; }
+  return img;
+}
+function rebuildChar() {
   S.ch.full = null;
-  S.ch.fullCanvas = full;
-  S.ch.prev = mkLevel(toCanvas(full, LIM.prevCh));
+  if (S.ch.anim) {
+    // all frames share one crop box so the animation does not jitter
+    const imgs = S.ch.anim.frames.map(cleanChar);
+    let box = null;
+    for (const im of imgs) box = alphaBox(im, box);
+    if (box[2] < 0) { toast('抠完什么都不剩了，把容差调小一点'); return false; }
+    S.ch.frames = imgs.map(im => mkLevel(cropCanvas(im, box)));
+    S.ch.fullCanvas = null;
+    S.ch.prev = S.ch.frames[0];
+  } else {
+    const full = cropToAlpha(cleanChar(S.ch.origData));
+    if (!full) { toast('抠完什么都不剩了，把容差调小一点'); return false; }
+    S.ch.fullCanvas = full;
+    S.ch.prev = mkLevel(toCanvas(full, LIM.prevCh));
+  }
   S.ch.stats = charStats(S.ch.prev);
   S.ch.id = idSeq++;
   charLutCache.key = '';
@@ -1023,16 +1092,46 @@ function autoLight(fromBg) {
   if (fromBg) syncUI();
 }
 
+// Decode an animated GIF, scaling every frame down so all frames fit the memory budget.
+function loadGif(buf, kind) {
+  const n = Math.min(GIFKit.count(buf), MAX_FRAMES);
+  const canvases = [], frames = [], delays = [];
+  let side = 0, src = null;
+  const info = GIFKit.decode(buf, (rgba, delay, i, w, h) => {
+    if (i === 0) {
+      if (!kind) kind = opaqueFraction(rgba) < 0.985 ? 'ch' : 'bg';
+      const budget = kind === 'bg' ? LIM.animBg : LIM.animCh, lim = kind === 'bg' ? LIM.prevBg : LIM.prevCh;
+      side = Math.max(16, Math.floor(Math.min(lim, Math.max(w, h) * Math.min(1, Math.sqrt(budget / (n * w * h))))));
+      src = mk(w, h);
+    }
+    g2(src).putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
+    const c = toCanvas(src, side);
+    if (kind === 'bg') canvases.push(c); else frames.push(readData(c));
+    delays.push(delay);
+  }, MAX_FRAMES);
+  if (kind === 'bg') setBackground(null, { canvases, delays });
+  else setCharacter(null, { anim: { frames, delays } });
+  const total = delays.reduce((a, b) => a + b, 0) / 1000;
+  toast(`读到 ${delays.length} 帧动图（${total.toFixed(1)} 秒）` + (info.truncated ? `，太长了只取前 ${MAX_FRAMES} 帧` : '') + '。导出时会保存成 GIF。');
+}
+
 async function handleFile(file, kind) {
-  if (!file || !file.type.startsWith('image/')) { toast('请选择图片文件'); return; }
+  const isGif = file && (file.type === 'image/gif' || /\.gif$/i.test(file.name || ''));
+  if (!file || !(file.type.startsWith('image/') || isGif)) { toast('请选择图片文件'); return; }
   busy(true);
+  await new Promise(r => setTimeout(r, 20));
   try {
+    if (isGif) {
+      const buf = new Uint8Array(await file.arrayBuffer());
+      if (GIFKit.count(buf) > 1) { loadGif(buf, kind); return; }
+    }
     const url = URL.createObjectURL(file);
     const img = await loadImage(url);
     if (!kind) kind = opaqueFraction(readData(toCanvas(img, 200)).data) < 0.985 ? 'ch' : 'bg';
     if (kind === 'bg') setBackground(img); else setCharacter(img);
     URL.revokeObjectURL(url);
   } catch (e) {
+    console.error(e);
     toast(e.message || String(e));
   } finally { busy(false); }
 }
@@ -1119,30 +1218,36 @@ function loadDemo() {
 
 // ---------------------------------------------------------------- UI schema
 const B = (k, label, min = 0, max = 100, extra = {}) => ({ k, label, min, max, ...extra });
+// b: shown in simple mode too · so: simple mode only · everything else is advanced-only
 const UI = {
   light: [
     { sec: '光从哪来' },
     { type: 'src' },
     { type: 'note', text: '自动：在背景里找最亮的一片当光源。找得不对就直接拖画面里的小太阳。' },
-    { sec: '人物怎么被照' },
-    { type: 'presets', k: 'lightPreset', items: [
+    { sec: '人物怎么被照', b: 1 },
+    { type: 'presets', k: 'lightPreset', b: 1, items: [
       ['auto', '自动', '✦'], ['front', '正面光', '◉'], ['top', '顶光', '⬆'], ['back', '背光', '◐', '常用'],
       ['left', '左侧光', '◧'], ['right', '右侧光', '◨'], ['bottom', '底光', '⬇'], ['shadow', '在阴影里', '☁'],
     ] },
-    { type: 'note', id: 'presetNote', text: '' },
+    { type: 'note', id: 'presetNote', text: '', b: 1 },
+    { type: 'note', text: '光源位置不对？直接拖画面里的小太阳。', so: 1 },
     { type: 'color', k: 'lightColor', label: '光的颜色' },
-    B('intensity', '光的强度', 0, 200),
+    B('intensity', '光的强度', 0, 200, { b: 1 }),
     B('lz', '光在人后↔前', -100, 100),
     B('range', '照射范围'),
-    { sec: '明暗与轮廓' },
-    B('rim', '轮廓光'), B('rimWidth', '轮廓光宽度'),
+    { sec: '融进背景', so: 1 },
+    B('blendAmt', '融合程度', 0, 100, { so: 1 }),
+    { type: 'note', text: '越往右，人物的亮度和颜色越贴近背景，边缘也透进更多背景色。', so: 1 },
+    { sec: '明暗与轮廓', b: 1 },
+    B('rim', '轮廓光', 0, 100, { b: 1 }), B('rimWidth', '轮廓光宽度'),
     B('dark', '背光面压暗'), B('shadowTint', '暗面带环境色'), B('lightTint', '亮面带光色'),
-    { sec: '画面里的光' },
-    B('glow', '光晕'), B('glowSize', '光晕大小'), B('rays', '光束'),
-    { sec: '投影' },
-    { type: 'toggle', k: 'castShadow', label: '地面投影', note: '人物全身站在地上时打开；半身、头像别开' },
+    { sec: '画面里的光', b: 1 },
+    B('glow', '光晕', 0, 100, { b: 1 }), B('glowSize', '光晕大小'), B('rays', '光束', 0, 100, { b: 1 }),
+    { sec: '投影', b: 1 },
+    { type: 'toggle', k: 'castShadow', label: '地面投影', note: '人物全身站在地上时打开；半身、头像别开', b: 1 },
     B('shadowLen', '影子长度', 0, 100, { dep: 'castShadow' }), B('shadowOpacity', '影子浓度', 0, 100, { dep: 'castShadow' }), B('shadowSoft', '影子柔和', 0, 100, { dep: 'castShadow' }),
     B('halo', '贴身暗晕'),
+    { type: 'more', so: 1 },
   ],
   blend: [
     { sec: '颜色对齐' },
@@ -1156,27 +1261,29 @@ const UI = {
     { type: 'note', text: '脚下融进前景：背景是草地、花丛时，把前面的草叶盖到脚上。边缘烟雾：下半身和边缘起一层薄雾。' },
   ],
   person: [
-    { sec: '位置' },
-    B('size', '大小', 5, 160), B('rot', '旋转', -45, 45),
-    { type: 'actions', items: [['flip', '左右翻转'], ['center', '水平居中'], ['ground', '脚踩到底']] },
+    { sec: '位置', b: 1 },
+    B('size', '大小', 5, 160, { b: 1 }), B('rot', '旋转', -45, 45),
+    { type: 'actions', b: 1, items: [['flip', '左右翻转'], ['center', '水平居中'], ['ground', '脚踩到底']] },
     { sec: '人物本身' },
     B('chBright', '亮度', -100, 100), B('chContrast', '对比', -100, 100), B('chSat', '饱和', -100, 100), B('chTemp', '冷暖', -100, 100),
-    { sec: '抠图修边' },
-    { type: 'toggle', k: 'cut', label: '抠掉纯色底', note: '白底、灰底、纯色底的图用这个' },
+    { sec: '抠图修边', b: 1 },
+    { type: 'toggle', k: 'cut', label: '抠掉纯色底', note: '白底、灰底、纯色底的图用这个', b: 1 },
     B('cutTol', '抠底容差', 1, 60, { dep: 'cut', heavy: true }),
-    { type: 'toggle', k: 'border', label: '去贴纸白边', note: '透明底但带一圈白描边的贴纸' },
+    { type: 'toggle', k: 'border', label: '去贴纸白边', note: '透明底但带一圈白描边的贴纸', b: 1 },
     B('borderTol', '白边容差', 1, 60, { dep: 'border', heavy: true }), B('borderWidth', '白边粗细', 1, 40, { dep: 'border', heavy: true }),
     B('choke', '边缘收缩', 0, 4, { heavy: true, unit: 'px' }),
     { type: 'note', text: '边缘还有一圈杂色？把「边缘收缩」调到 1–2。' },
+    { type: 'more', so: 1 },
   ],
   grade: [
-    { sec: '风格' },
-    { type: 'presets', k: 'style', cls: 'three', items: [['none', '原样'], ['film', '胶片'], ['cinema', '电影感'], ['clear', '清透'], ['dusk', '暮光暖调'], ['night', '冷夜'], ['dream', '梦幻柔光']] },
+    { sec: '风格', b: 1 },
+    { type: 'presets', k: 'style', cls: 'three', b: 1, items: [['none', '原样'], ['film', '胶片'], ['cinema', '电影感'], ['clear', '清透'], ['dusk', '暮光暖调'], ['night', '冷夜'], ['dream', '梦幻柔光']] },
     { sec: '细调' },
     B('exposure', '曝光', -100, 100), B('temp', '色温', -100, 100), B('contrast', '对比', -100, 100), B('saturation', '饱和', -100, 100), B('fade', '褪色'),
     { type: 'color', k: 'splitShadow', label: '暗部色调', noExtra: true }, B('splitShadowAmt', '暗部染色'),
     { type: 'color', k: 'splitHigh', label: '亮部色调', noExtra: true }, B('splitHighAmt', '亮部染色'),
     B('bloom', '柔光'), B('vignette', '暗角'), B('grain', '颗粒'),
+    { type: 'more', so: 1 },
   ],
 };
 const PRESET_NOTES = {
@@ -1195,108 +1302,119 @@ function buildUI() {
   for (const [tab, items] of Object.entries(UI)) {
     const root = $('#tab-' + tab);
     for (const it of items) {
-      if (it.sec) { const d = document.createElement('div'); d.className = 'sec'; d.textContent = it.sec; root.append(d); continue; }
-      if (it.type === 'note') {
-        const p = document.createElement('p'); p.className = 'note'; p.textContent = it.text; if (it.id) p.id = it.id; root.append(p); continue;
-      }
-      if (it.type === 'src') {
-        const g = document.createElement('div'); g.className = 'grid-btns two';
-        g.innerHTML = '<button class="chip" data-src="auto">自动找光源</button><button class="chip" data-src="drag">拖画面里的光点</button>';
-        g.addEventListener('click', e => {
-          const b = e.target.closest('[data-src]'); if (!b) return;
-          S.lightSrc = b.dataset.src;
-          if (S.lightSrc === 'auto') autoLight();
-          else toast('拖动画面里的小太阳来放光源');
-          syncUI(); schedule();
-        });
-        root.append(g);
-        controls.push({ sync() { $$('[data-src]', g).forEach(b => b.classList.toggle('on', b.dataset.src === S.lightSrc)); } });
-        continue;
-      }
-      if (it.type === 'presets') {
-        const g = document.createElement('div'); g.className = 'grid-btns ' + (it.cls || '');
-        for (const [v, label, ico, tag] of it.items) {
-          const b = document.createElement('button'); b.className = 'chip'; b.dataset.v = v;
-          b.innerHTML = (ico ? `<span class="ico">${ico}</span>` : '') + label + (tag ? `<span class="tag">${tag}</span>` : '');
-          g.append(b);
-        }
-        g.addEventListener('click', e => {
-          const b = e.target.closest('[data-v]'); if (!b) return;
-          if (it.k === 'lightPreset') applyLightPreset(b.dataset.v);
-          else applyStyle(b.dataset.v);
-        });
-        root.append(g);
-        controls.push({ sync() { $$('[data-v]', g).forEach(b => b.classList.toggle('on', b.dataset.v === P[it.k])); } });
-        continue;
-      }
-      if (it.type === 'color') {
-        const row = document.createElement('div'); row.className = 'color-row';
-        row.innerHTML = `<label>${it.label}</label><input type="color" value="${P[it.k]}">` +
-          (it.noExtra ? '<span></span>' : '<div class="mini"><button data-a="auto">跟背景</button><button data-a="pick">画面取色</button></div>');
-        const inp = $('input', row);
-        inp.addEventListener('input', () => {
-          P[it.k] = inp.value;
-          if (it.k === 'lightColor') P.lightColorAuto = false;
-          if (it.k.startsWith('split')) P.style = 'custom';
-          syncUI(); schedule();
-        });
-        if (!it.noExtra) {
-          row.addEventListener('click', e => {
-            const b = e.target.closest('[data-a]'); if (!b) return;
-            if (b.dataset.a === 'auto') { P.lightColorAuto = true; autoLight(); }
-            else { S.pick = !S.pick; $('#frame').classList.toggle('picking', S.pick); if (S.pick) toast('点一下画面，取那里的颜色当光色'); }
-            syncUI(); schedule();
-          });
-        }
-        root.append(row);
-        controls.push({ sync() {
-          inp.value = P[it.k];
-          if (!it.noExtra) {
-            $('[data-a=auto]', row).classList.toggle('on', P.lightColorAuto);
-            $('[data-a=pick]', row).classList.toggle('on', S.pick);
-          }
-        } });
-        continue;
-      }
-      if (it.type === 'toggle') {
-        const row = document.createElement('div'); row.className = 'toggle-row';
-        row.innerHTML = `<span class="t-label">${it.label}${it.note ? `<small>${it.note}</small>` : ''}</span><label class="switch"><input type="checkbox"><span></span></label>`;
-        const inp = $('input', row);
-        inp.addEventListener('change', () => { setParam(it.k, inp.checked); });
-        root.append(row);
-        controls.push({ sync() { inp.checked = !!P[it.k]; } });
-        continue;
-      }
-      if (it.type === 'actions') {
-        const g = document.createElement('div'); g.className = 'grid-btns three';
-        for (const [a, label] of it.items) { const b = document.createElement('button'); b.className = 'chip'; b.dataset.act = a; b.textContent = label; g.append(b); }
-        g.addEventListener('click', e => {
-          const b = e.target.closest('[data-act]'); if (!b || !S.ch) return;
-          const a = b.dataset.act;
-          if (a === 'flip') S.xf.flip = !S.xf.flip;
-          if (a === 'center') S.xf.x = 0.5;
-          if (a === 'ground') groundFeet();
-          schedule();
-        });
-        root.append(g);
-        continue;
-      }
-      // slider
-      const row = document.createElement('div'); row.className = 'row';
-      row.innerHTML = `<label>${it.label}</label><input type="range" min="${it.min}" max="${it.max}" step="1"><output></output>`;
-      const inp = $('input', row), out = $('output', row);
-      const paint = () => { inp.style.setProperty('--p', ((inp.value - it.min) / (it.max - it.min) * 100) + '%'); out.textContent = inp.value + (it.unit || ''); };
-      inp.addEventListener('input', () => {
-        paint();
-        if (it.heavy) { out.textContent = inp.value + (it.unit || ''); return; }
-        setParam(it.k, +inp.value);
-      });
-      if (it.heavy) inp.addEventListener('change', () => setParam(it.k, +inp.value));
-      inp.addEventListener('dblclick', () => { inp.value = DEF[it.k]; paint(); setParam(it.k, DEF[it.k]); });
-      root.append(row);
-      controls.push({ sync() { inp.value = P[it.k]; paint(); if (it.dep) row.classList.toggle('disabled', !P[it.dep]); } });
+      const n0 = root.children.length;
+      buildItem(it, root);
+      for (let i = n0; i < root.children.length; i++) root.children[i].dataset.lvl = it.so ? 'simple' : it.b ? 'basic' : 'adv';
     }
   }
+}
+function buildItem(it, root) {
+  if (it.sec) { const d = document.createElement('div'); d.className = 'sec'; d.textContent = it.sec; root.append(d); return; }
+  if (it.type === 'more') {
+    const b = document.createElement('button'); b.className = 'ghost wide more-adv';
+    b.textContent = '想细调？打开高级选项（全部滑杆）';
+    b.addEventListener('click', () => setMode('adv'));
+    root.append(b); return;
+  }
+  if (it.type === 'note') {
+    const p = document.createElement('p'); p.className = 'note'; p.textContent = it.text; if (it.id) p.id = it.id; root.append(p); return;
+  }
+  if (it.type === 'src') {
+    const g = document.createElement('div'); g.className = 'grid-btns two';
+    g.innerHTML = '<button class="chip" data-src="auto">自动找光源</button><button class="chip" data-src="drag">拖画面里的光点</button>';
+    g.addEventListener('click', e => {
+      const b = e.target.closest('[data-src]'); if (!b) return;
+      S.lightSrc = b.dataset.src;
+      if (S.lightSrc === 'auto') autoLight();
+      else toast('拖动画面里的小太阳来放光源');
+      syncUI(); schedule();
+    });
+    root.append(g);
+    controls.push({ sync() { $$('[data-src]', g).forEach(b => b.classList.toggle('on', b.dataset.src === S.lightSrc)); } });
+    return;
+  }
+  if (it.type === 'presets') {
+    const g = document.createElement('div'); g.className = 'grid-btns ' + (it.cls || '');
+    for (const [v, label, ico, tag] of it.items) {
+      const b = document.createElement('button'); b.className = 'chip'; b.dataset.v = v;
+      b.innerHTML = (ico ? `<span class="ico">${ico}</span>` : '') + label + (tag ? `<span class="tag">${tag}</span>` : '');
+      g.append(b);
+    }
+    g.addEventListener('click', e => {
+      const b = e.target.closest('[data-v]'); if (!b) return;
+      if (it.k === 'lightPreset') applyLightPreset(b.dataset.v);
+      else applyStyle(b.dataset.v);
+    });
+    root.append(g);
+    controls.push({ sync() { $$('[data-v]', g).forEach(b => b.classList.toggle('on', b.dataset.v === P[it.k])); } });
+    return;
+  }
+  if (it.type === 'color') {
+    const row = document.createElement('div'); row.className = 'color-row';
+    row.innerHTML = `<label>${it.label}</label><input type="color" value="${P[it.k]}">` +
+      (it.noExtra ? '<span></span>' : '<div class="mini"><button data-a="auto">跟背景</button><button data-a="pick">画面取色</button></div>');
+    const inp = $('input', row);
+    inp.addEventListener('input', () => {
+      P[it.k] = inp.value;
+      if (it.k === 'lightColor') P.lightColorAuto = false;
+      if (it.k.startsWith('split')) P.style = 'custom';
+      syncUI(); schedule();
+    });
+    if (!it.noExtra) {
+      row.addEventListener('click', e => {
+        const b = e.target.closest('[data-a]'); if (!b) return;
+        if (b.dataset.a === 'auto') { P.lightColorAuto = true; autoLight(); }
+        else { S.pick = !S.pick; $('#frame').classList.toggle('picking', S.pick); if (S.pick) toast('点一下画面，取那里的颜色当光色'); }
+        syncUI(); schedule();
+      });
+    }
+    root.append(row);
+    controls.push({ sync() {
+      inp.value = P[it.k];
+      if (!it.noExtra) {
+        $('[data-a=auto]', row).classList.toggle('on', P.lightColorAuto);
+        $('[data-a=pick]', row).classList.toggle('on', S.pick);
+      }
+    } });
+    return;
+  }
+  if (it.type === 'toggle') {
+    const row = document.createElement('div'); row.className = 'toggle-row';
+    row.innerHTML = `<span class="t-label">${it.label}${it.note ? `<small>${it.note}</small>` : ''}</span><label class="switch"><input type="checkbox"><span></span></label>`;
+    const inp = $('input', row);
+    inp.addEventListener('change', () => { setParam(it.k, inp.checked); });
+    root.append(row);
+    controls.push({ sync() { inp.checked = !!P[it.k]; } });
+    return;
+  }
+  if (it.type === 'actions') {
+    const g = document.createElement('div'); g.className = 'grid-btns three';
+    for (const [a, label] of it.items) { const b = document.createElement('button'); b.className = 'chip'; b.dataset.act = a; b.textContent = label; g.append(b); }
+    g.addEventListener('click', e => {
+      const b = e.target.closest('[data-act]'); if (!b || !S.ch) return;
+      const a = b.dataset.act;
+      if (a === 'flip') S.xf.flip = !S.xf.flip;
+      if (a === 'center') S.xf.x = 0.5;
+      if (a === 'ground') groundFeet();
+      schedule();
+    });
+    root.append(g);
+    return;
+  }
+  // slider
+  const row = document.createElement('div'); row.className = 'row';
+  row.innerHTML = `<label>${it.label}</label><input type="range" min="${it.min}" max="${it.max}" step="1"><output></output>`;
+  const inp = $('input', row), out = $('output', row);
+  const paint = () => { inp.style.setProperty('--p', ((inp.value - it.min) / (it.max - it.min) * 100) + '%'); out.textContent = inp.value + (it.unit || ''); };
+  inp.addEventListener('input', () => {
+    paint();
+    if (it.heavy) { out.textContent = inp.value + (it.unit || ''); return; }
+    setParam(it.k, +inp.value);
+  });
+  if (it.heavy) inp.addEventListener('change', () => setParam(it.k, +inp.value));
+  inp.addEventListener('dblclick', () => { inp.value = DEF[it.k]; paint(); setParam(it.k, DEF[it.k]); });
+  root.append(row);
+  controls.push({ sync() { inp.value = P[it.k]; paint(); if (it.dep) row.classList.toggle('disabled', !P[it.dep]); } });
 }
 function syncUI() {
   for (const c of controls) c.sync();
@@ -1304,8 +1422,10 @@ function syncUI() {
   const sun = $('#sun');
   sun.style.setProperty('--sun', P.lightColor);
 }
+const BLEND_BASE = { matchLuma: 55, matchTint: 50, matchSat: 25, wrap: 45 };
 function setParam(k, v) {
   P[k] = v;
+  if (k === 'blendAmt') for (const [key, base] of Object.entries(BLEND_BASE)) P[key] = clamp(Math.round(base * v / 50), 0, 100);
   if (STYLE_KEYS.includes(k)) P.style = 'custom';
   if (REBUILD_KEYS.has(k) && S.ch) {
     busy(true);
@@ -1380,6 +1500,32 @@ function placeSun() {
   sun.classList.toggle('hidden', S.view === 'sticker' || S.compare);
 }
 new ResizeObserver(layoutFrame).observe(wrap);
+
+// animation playback: re-render only when a frame index changes
+let animT0 = performance.now(), animKey = '';
+function animTick() {
+  requestAnimationFrame(animTick);
+  if (!S.playing || S.exporting || !isAnim()) return;
+  S.t = performance.now() - animT0;
+  const key = (S.bg && S.bg.tl ? idxAt(S.bg.tl, S.t) : 0) + ',' + (S.ch && S.ch.tl ? idxAt(S.ch.tl, S.t) : 0);
+  if (key !== animKey) { animKey = key; schedule(); }
+}
+requestAnimationFrame(animTick);
+const playBtn = $('#playBtn');
+function setPlaying(v) {
+  S.playing = v;
+  if (v) animT0 = performance.now() - S.t;
+  playBtn.textContent = v ? '❚❚ 暂停' : '▶ 播放';
+  playBtn.classList.toggle('on', !v);
+}
+playBtn.addEventListener('click', () => setPlaying(!S.playing));
+function animChanged() {
+  const a = isAnim();
+  playBtn.hidden = !a;
+  if (!a) S.t = 0;
+  setPlaying(true);
+  updateExportNote();
+}
 
 function normPoint(e) {
   const r = view.getBoundingClientRect();
@@ -1465,10 +1611,37 @@ hold.addEventListener('pointerdown', e => { e.preventDefault(); setCompare(true)
 ['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => hold.addEventListener(ev, () => S.compare && setCompare(false)));
 
 // tabs
+function showTab(t) {
+  $$('#tabs [data-t]').forEach(x => x.classList.toggle('on', x.dataset.t === t));
+  $$('.tab').forEach(x => x.classList.toggle('on', x.id === 'tab-' + t));
+}
 $('#tabs').addEventListener('click', e => {
-  const b = e.target.closest('[data-t]'); if (!b) return;
-  $$('#tabs button').forEach(x => x.classList.toggle('on', x === b));
-  $$('.tab').forEach(t => t.classList.toggle('on', t.id === 'tab-' + b.dataset.t));
+  const b = e.target.closest('[data-t]'); if (b) showTab(b.dataset.t);
+});
+
+// simple / advanced mode
+let mode = 'simple';
+try { if (localStorage.getItem('rg_mode') === 'adv') mode = 'adv'; } catch (e) {}
+function setMode(m) {
+  mode = m;
+  try { localStorage.setItem('rg_mode', m); } catch (e) {}
+  const simple = m === 'simple';
+  document.body.classList.toggle('simple', simple);
+  $$('#tabs [data-t]').forEach(b => { b.textContent = simple ? b.dataset.s || b.dataset.a : b.dataset.a; });
+  const adv = $('#advBtn');
+  adv.classList.toggle('on', !simple);
+  adv.setAttribute('aria-pressed', String(!simple));
+  const cur = $('#tabs [data-t].on');
+  if (simple && cur && cur.dataset.lvl === 'adv') showTab('light');
+  if (simple && (S.view === 'luma' || S.view === 'color')) {
+    S.view = 'blend';
+    $$('#viewSeg button').forEach(x => x.classList.toggle('on', x.dataset.v === 'blend'));
+    schedule();
+  }
+}
+$('#advBtn').addEventListener('click', () => {
+  setMode(mode === 'simple' ? 'adv' : 'simple');
+  toast(mode === 'adv' ? '已打开高级选项：所有滑杆都在，「融合」页也出来了' : '已回到简单模式');
 });
 
 // files
@@ -1497,9 +1670,67 @@ $('#resetAll').addEventListener('click', () => {
 });
 
 // export
+function gifSize() {
+  const bp = S.bg.prev, sc = Math.min(1, LIM.gif / Math.max(bp.w, bp.h));
+  return { w: Math.max(2, Math.round(bp.w * sc)), h: Math.max(2, Math.round(bp.h * sc)) };
+}
 function updateExportNote() {
   if (!S.bg) return;
-  $('#exportNote').textContent = `按背景尺寸导出：${S.bg.full.w} × ${S.bg.full.h}`;
+  const a = isAnim();
+  $('#savePng').textContent = a ? '保存 GIF 动图' : '保存 PNG';
+  $('#saveJpg').textContent = a ? '存当前这一帧' : '保存 JPG';
+  if (a) {
+    const g = gifSize(), { ts, dur } = exportTimes();
+    $('#exportNote').textContent = `GIF：${g.w} × ${g.h}，${ts.length} 帧，${(dur / 1000).toFixed(1)} 秒一循环`;
+  } else $('#exportNote').textContent = `按背景尺寸导出：${S.bg.full.w} × ${S.bg.full.h}`;
+}
+function fileName(ext) { return `溶光-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}.${ext}`; }
+async function deliver(blob, name) {
+  const file = new File([blob], name, { type: blob.type });
+  if (isMobile && navigator.canShare && navigator.canShare({ files: [file] })) {
+    try { await navigator.share({ files: [file] }); return; } catch (e) { if (e.name === 'AbortError') return; }
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  toast(`已保存 ${name}（${(blob.size / 1048576).toFixed(1)} MB）`);
+}
+const nextTick = () => new Promise(r => setTimeout(r, 0));
+async function saveGif(opts = {}) {
+  if (!S.bg || !isAnim()) return;
+  const btns = [$('#savePng'), $('#saveJpg')];
+  btns.forEach(b => (b.disabled = true));
+  const keep = { view: S.view, compare: S.compare, t: S.t };
+  S.exporting = true; S.view = 'blend'; S.compare = false;
+  try {
+    const { ts, dur } = exportTimes(), { w, h } = gifSize();
+    const out = mk(w, h), ox = out.getContext('2d', { willReadFrequently: true });
+    ox.imageSmoothingQuality = 'high';
+    const frameAt = t => { S.t = t; ox.drawImage(render(false), 0, 0, w, h); return ox.getImageData(0, 0, w, h).data; };
+    // one palette for the whole loop, from a handful of frames
+    busy(true, '正在挑颜色…'); await nextTick();
+    const m = Math.min(8, ts.length), stride = Math.max(1, Math.floor(w * h / 40000));
+    const smp = [];
+    for (let k = 0; k < m; k++) {
+      const d = frameAt(ts[Math.floor(k * ts.length / m)]);
+      for (let i = 0; i < w * h; i += stride) smp.push(d[i * 4], d[i * 4 + 1], d[i * 4 + 2]);
+    }
+    const enc = new GIFKit.Encoder(w, h, GIFKit.buildPalette(Uint8Array.from(smp), 255));
+    for (let i = 0; i < ts.length; i++) {
+      if (i % 2 === 0) { busy(true, `正在导出 GIF ${i + 1} / ${ts.length}`); await nextTick(); }
+      enc.addFrame(frameAt(ts[i]), (i + 1 < ts.length ? ts[i + 1] : dur) - ts[i]);
+    }
+    const blob = enc.finish();
+    if (opts.keep) return blob;
+    await deliver(blob, fileName('gif'));
+  } catch (e) {
+    console.error(e); toast(e.message || String(e));
+  } finally {
+    Object.assign(S, keep); S.exporting = false;
+    btns.forEach(b => (b.disabled = false)); busy(false);
+    schedule();
+  }
 }
 async function save(type) {
   if (!S.bg) return;
@@ -1513,16 +1744,7 @@ async function save(type) {
     S.view = prevView; S.compare = prevCmp;
     const blob = await new Promise(r => comp.toBlob(r, type, 0.95));
     if (!blob) throw new Error('导出失败，图片可能太大了');
-    const name = `溶光-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}.${type === 'image/png' ? 'png' : 'jpg'}`;
-    const file = new File([blob], name, { type });
-    if (isMobile && navigator.canShare && navigator.canShare({ files: [file] })) {
-      try { await navigator.share({ files: [file] }); return; } catch (e) { if (e.name === 'AbortError') return; }
-    }
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob); a.download = name;
-    document.body.append(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-    toast('已保存 ' + name);
+    await deliver(blob, fileName(type === 'image/png' ? 'png' : 'jpg'));
   } catch (e) {
     toast(e.message || String(e));
   } finally {
@@ -1531,8 +1753,8 @@ async function save(type) {
     schedule();
   }
 }
-$('#savePng').addEventListener('click', () => save('image/png'));
-$('#saveJpg').addEventListener('click', () => save('image/jpeg'));
+$('#savePng').addEventListener('click', () => (isAnim() ? saveGif() : save('image/png')));
+$('#saveJpg').addEventListener('click', () => save(isAnim() ? 'image/png' : 'image/jpeg'));
 
 // misc
 let toastT = 0;
@@ -1547,7 +1769,8 @@ function busy(on, text) {
 }
 
 buildUI();
+setMode(mode);
 syncUI();
 loadDemo();
-window.__rongguang = { S, P, render };
+window.__rongguang = { S, P, render, handleFile, saveGif, setMode };
 })();

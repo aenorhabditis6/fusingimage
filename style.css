@@ -204,3 +204,19 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border-radius: 
   .row { grid-template-columns: 84px 1fr 36px; }
   .how { padding-top: 24px; }
 }
+
+/* simple / advanced mode */
+body.simple [data-lvl="adv"] { display: none !important; }
+body:not(.simple) [data-lvl="simple"] { display: none !important; }
+.viewbar-r { display: flex; gap: 6px; }
+#playBtn.on { color: var(--accent); border-color: var(--accent); }
+.tabs .adv-btn {
+  flex: none; align-self: center; margin-left: 4px; display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--line); background: var(--panel-2); border-radius: 999px; padding: 4px 10px;
+  font-size: 12px; color: var(--muted);
+}
+.tabs .adv-btn:hover { color: var(--text); }
+.adv-dot { width: 8px; height: 8px; border-radius: 50%; background: #4a4a52; transition: background .15s; }
+.tabs .adv-btn.on { color: var(--text); border-color: var(--accent); }
+.tabs .adv-btn.on .adv-dot { background: var(--accent); }
+.more-adv { margin-top: 18px; }

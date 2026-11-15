@@ -184,7 +184,7 @@ const DEF = {
   // person
   size: 72, rot: 0,
   chBright: 0, chContrast: 0, chSat: 0, chTemp: 0,
-  cut: false, cutTol: 18, border: false, borderTol: 22, borderWidth: 14, choke: 0,
+  cut: false, cutTol: 18, specks: false, border: false, borderTol: 22, borderWidth: 14, choke: 0,
   // blend
   blendAmt: 50, matchLuma: 55, matchTint: 50, matchSat: 25, wrap: 45, wrapWidth: 35, feetFg: 0, haze: 0,
   // light
@@ -198,7 +198,7 @@ const DEF = {
   bloom: 0, vignette: 15, grain: 8,
 };
 const P = { ...DEF };
-const REBUILD_KEYS = new Set(['cut', 'cutTol', 'border', 'borderTol', 'borderWidth', 'choke']);
+const REBUILD_KEYS = new Set(['cut', 'cutTol', 'specks', 'border', 'borderTol', 'borderWidth', 'choke']);
 
 const LIGHT_PRESETS = {
   auto:   { lz: -30, rim: 60, dark: 35, lightTint: 40 },
@@ -390,6 +390,32 @@ function cropCanvas(img, box) {
 function cropToAlpha(img) {
   const box = alphaBox(img);
   return box[2] < 0 ? null : cropCanvas(img, box);
+}
+// Drop disconnected bits much smaller than the main body (mouse pointer, watermark, dust).
+function removeSpecks(img, frac = 0.03) {
+  const { width: w, height: h, data: d } = img, n = w * h;
+  const lab = new Int32Array(n), q = new Int32Array(n), sizes = [0];
+  let max = 0;
+  for (let s = 0; s < n; s++) {
+    if (lab[s] || d[s * 4 + 3] <= 8) continue;
+    const L = sizes.length;
+    let qh = 0, qt = 0, cnt = 0;
+    q[qt++] = s; lab[s] = L;
+    while (qh < qt) {
+      const i = q[qh++], x = i % w, y = (i / w) | 0; cnt++;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = y + dy; if (yy < 0 || yy >= h) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx; if (xx < 0 || xx >= w) continue;
+          const j = yy * w + xx;
+          if (!lab[j] && d[j * 4 + 3] > 8) { lab[j] = L; q[qt++] = j; }
+        }
+      }
+    }
+    sizes.push(cnt); if (cnt > max) max = cnt;
+  }
+  const thr = max * frac;
+  for (let i = 0; i < n; i++) if (lab[i] && sizes[lab[i]] < thr) d[i * 4 + 3] = 0;
 }
 function opaqueFraction(d) {
   let opaque = 0, cnt = 0;
@@ -1035,7 +1061,7 @@ function setCharacter(img, opts = {}) {
   }
   const opaque = opaqueFraction(data.data) > 0.985;
   S.ch = { id: idSeq++, origData: data, w, h, anim: opts.anim || null, tl: opts.anim ? mkTimeline(opts.anim.delays) : null };
-  P.cut = opaque; P.border = false; P.choke = 0;
+  P.cut = opaque; P.border = false; P.choke = 0; P.specks = !!opts.specks;
   if (!rebuildChar()) return;
   if (!opts.keepPos) {
     const lv = S.ch.prev;
@@ -1055,6 +1081,7 @@ function cleanChar(o) {
   if (P.cut) cutoutBorder(img, P.cutTol);
   if (P.border) removeOutline(img, P.borderTol, Math.max(2, Math.round(P.borderWidth / 1000 * Math.max(o.width, o.height))));
   if (P.choke > 0) choke(img, P.choke);
+  if (P.specks) removeSpecks(img);
   return img;
 }
 function rebuildChar() {
@@ -1092,42 +1119,115 @@ function autoLight(fromBg) {
   if (fromBg) syncUI();
 }
 
-// Decode an animated GIF, scaling every frame down so all frames fit the memory budget.
+// Is the image's outer border (nearly) one colour? Then it is probably a character on a plain backdrop.
+function borderUniform(d, w, h) {
+  const ref = borderRef(d, w, h);
+  let ok = 0, n = 0;
+  const test = i => { n++; if (Math.max(Math.abs(d[i] - ref[0]), Math.abs(d[i + 1] - ref[1]), Math.abs(d[i + 2] - ref[2])) < 40) ok++; };
+  const step = Math.max(1, Math.round((w + h) / 400));
+  for (let x = 0; x < w; x += step) { test(x * 4); test(((h - 1) * w + x) * 4); }
+  for (let y = 0; y < h; y += step) { test(y * w * 4); test((y * w + w - 1) * 4); }
+  return ok / n > 0.9;
+}
+function guessKind(d, w, h) {
+  return opaqueFraction(d) < 0.985 || borderUniform(d, w, h) ? 'ch' : 'bg';
+}
+
+// Collects animation frames, scaling each so all frames fit the memory budget.
+function frameSink(kind, n, w, h) {
+  const budget = kind === 'bg' ? LIM.animBg : LIM.animCh, lim = kind === 'bg' ? LIM.prevBg : LIM.prevCh;
+  const side = Math.max(16, Math.floor(Math.min(lim, Math.max(w, h) * Math.min(1, Math.sqrt(budget / (n * w * h))))));
+  const canvases = [], frames = [], delays = [];
+  return {
+    push(src, delay) {
+      const c = toCanvas(src, side);
+      if (kind === 'bg') canvases.push(c); else frames.push(readData(c));
+      delays.push(delay);
+    },
+    finish(opts = {}) {
+      if (kind === 'bg') setBackground(null, { canvases, delays });
+      else setCharacter(null, { anim: { frames, delays }, quiet: true, ...opts });
+      return { count: delays.length, secs: delays.reduce((a, b) => a + b, 0) / 1000 };
+    },
+  };
+}
+
 function loadGif(buf, kind) {
   const n = Math.min(GIFKit.count(buf), MAX_FRAMES);
-  const canvases = [], frames = [], delays = [];
-  let side = 0, src = null;
+  let sink = null, src = null;
   const info = GIFKit.decode(buf, (rgba, delay, i, w, h) => {
     if (i === 0) {
-      if (!kind) kind = opaqueFraction(rgba) < 0.985 ? 'ch' : 'bg';
-      const budget = kind === 'bg' ? LIM.animBg : LIM.animCh, lim = kind === 'bg' ? LIM.prevBg : LIM.prevCh;
-      side = Math.max(16, Math.floor(Math.min(lim, Math.max(w, h) * Math.min(1, Math.sqrt(budget / (n * w * h))))));
-      src = mk(w, h);
+      if (!kind) kind = guessKind(rgba, w, h);
+      sink = frameSink(kind, n, w, h); src = mk(w, h);
     }
     g2(src).putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
-    const c = toCanvas(src, side);
-    if (kind === 'bg') canvases.push(c); else frames.push(readData(c));
-    delays.push(delay);
+    sink.push(src, delay);
   }, MAX_FRAMES);
-  if (kind === 'bg') setBackground(null, { canvases, delays });
-  else setCharacter(null, { anim: { frames, delays } });
-  const total = delays.reduce((a, b) => a + b, 0) / 1000;
-  toast(`读到 ${delays.length} 帧动图（${total.toFixed(1)} 秒）` + (info.truncated ? `，太长了只取前 ${MAX_FRAMES} 帧` : '') + '。导出时会保存成 GIF。');
+  const r = sink.finish();
+  toast(`读到 ${r.count} 帧动图（${r.secs.toFixed(1)} 秒）` + (info.truncated ? `，太长了只取前 ${MAX_FRAMES} 帧` : '') +
+    (kind === 'ch' && P.cut ? '，已自动抠掉纯色底' : '') + '。导出时会保存成 GIF。');
+}
+
+// Video → frames by seeking. Frame rate chosen so delays are whole centiseconds (GIF timing).
+const MAX_VIDEO_SECS = 20;
+async function loadVideo(file, kind) {
+  const url = URL.createObjectURL(file);
+  const v = document.createElement('video');
+  v.muted = true; v.playsInline = true; v.preload = 'auto'; v.src = url;
+  try {
+    await new Promise((res, rej) => {
+      v.onloadeddata = res;
+      v.onerror = () => rej(new Error('这个视频读不出来。换成 MP4（H.264）或 WebM 试试'));
+    });
+    try { await v.play(); v.pause(); } catch (e) { /* autoplay blocked: seeking still works */ }
+    const full = v.duration;
+    if (!isFinite(full) || full <= 0) throw new Error('读不到视频长度');
+    const dur = Math.min(full, MAX_VIDEO_SECS), w = v.videoWidth, h = v.videoHeight;
+    const fps = [20, 50 / 3, 12.5, 10, 5].find(f => f * dur <= MAX_FRAMES) || 5;
+    const n = Math.max(1, Math.floor(dur * fps)), delay = Math.round(1000 / fps);
+    const src = mk(w, h), sx = src.getContext('2d', { willReadFrequently: true });
+    const seek = t => new Promise(res => {
+      const to = setTimeout(res, 3000);
+      v.onseeked = () => { clearTimeout(to); res(); };
+      v.currentTime = t;
+    });
+    let sink = null, specks = false;
+    for (let i = 0; i < n; i++) {
+      if (i % 5 === 0) { busy(true, `正在读视频 ${i + 1} / ${n}`); await new Promise(r => setTimeout(r, 0)); }
+      await seek(Math.min(full - 0.001, (i + 0.5) / fps));
+      sx.drawImage(v, 0, 0, w, h);
+      if (i === 0) {
+        if (!kind) kind = guessKind(sx.getImageData(0, 0, w, h).data, w, h);
+        sink = frameSink(kind, n, w, h);
+        specks = kind === 'ch';
+      }
+      sink.push(src, delay);
+    }
+    busy(true, '处理中…'); await new Promise(r => setTimeout(r, 0));
+    const r = sink.finish({ specks });
+    toast(`读到视频 ${r.count} 帧（${r.secs.toFixed(1)} 秒，每秒 ${Math.round(fps)} 帧）` + (full > MAX_VIDEO_SECS ? `，只取前 ${MAX_VIDEO_SECS} 秒` : '') +
+      (kind === 'ch' ? '。已自动抠掉纯色底、去掉零碎小块（鼠标指针之类）' : '') + '。导出是 GIF。');
+  } finally {
+    v.removeAttribute('src'); v.load();
+    URL.revokeObjectURL(url);
+  }
 }
 
 async function handleFile(file, kind) {
   const isGif = file && (file.type === 'image/gif' || /\.gif$/i.test(file.name || ''));
-  if (!file || !(file.type.startsWith('image/') || isGif)) { toast('请选择图片文件'); return; }
+  const isVideo = file && (file.type.startsWith('video/') || /\.(mp4|m4v|mov|webm)$/i.test(file.name || ''));
+  if (!file || !(file.type.startsWith('image/') || isGif || isVideo)) { toast('请选择图片、GIF 或视频文件'); return; }
   busy(true);
   await new Promise(r => setTimeout(r, 20));
   try {
+    if (isVideo) { await loadVideo(file, kind); return; }
     if (isGif) {
       const buf = new Uint8Array(await file.arrayBuffer());
       if (GIFKit.count(buf) > 1) { loadGif(buf, kind); return; }
     }
     const url = URL.createObjectURL(file);
     const img = await loadImage(url);
-    if (!kind) kind = opaqueFraction(readData(toCanvas(img, 200)).data) < 0.985 ? 'ch' : 'bg';
+    if (!kind) { const t = readData(toCanvas(img, 200)); kind = guessKind(t.data, t.width, t.height); }
     if (kind === 'bg') setBackground(img); else setCharacter(img);
     URL.revokeObjectURL(url);
   } catch (e) {
@@ -1269,6 +1369,7 @@ const UI = {
     { sec: '抠图修边', b: 1 },
     { type: 'toggle', k: 'cut', label: '抠掉纯色底', note: '白底、灰底、纯色底的图用这个', b: 1 },
     B('cutTol', '抠底容差', 1, 60, { dep: 'cut', heavy: true }),
+    { type: 'toggle', k: 'specks', label: '去掉零碎小块', note: '抠完还剩鼠标指针、水印、杂点时打开', b: 1 },
     { type: 'toggle', k: 'border', label: '去贴纸白边', note: '透明底但带一圈白描边的贴纸', b: 1 },
     B('borderTol', '白边容差', 1, 60, { dep: 'border', heavy: true }), B('borderWidth', '白边粗细', 1, 40, { dep: 'border', heavy: true }),
     B('choke', '边缘收缩', 0, 4, { heavy: true, unit: 'px' }),

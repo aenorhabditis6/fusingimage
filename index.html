@@ -7,7 +7,7 @@
 <meta name="description" content="把透明底或白底的 OC 立绘融进任意背景：自动对齐亮度和色调，加光源、轮廓光、投影。全部在浏览器本地计算，图片不上传。">
 <meta name="theme-color" content="#121214">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='%23f2a94a'/%3E%3Cpath d='M16 3a13 13 0 0 0 0 26z' fill='%23121214'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="style.css?v=2">
+<link rel="stylesheet" href="style.css?v=3">
 </head>
 <body>
 <header class="top">
@@ -38,7 +38,7 @@
         <div class="sun" id="sun" title="拖动改光源位置"></div>
       </div>
       <div class="busy" id="busy">处理中…</div>
-      <div class="drop-over" id="dropOver">松手放图：透明底会当人物，其它当背景</div>
+      <div class="drop-over" id="dropOver">松手放图：透明底、纯色底会当人物，其它当背景</div>
     </div>
     <p class="hint" id="hint">拖人物换位置 · 滚轮 / 双指缩放旋转 · 拖小太阳改光源</p>
   </section>
@@ -55,22 +55,22 @@
     <div class="tabbody">
       <div class="tab on" id="tab-assets">
         <label class="drop" id="dropBg">
-          <input type="file" accept="image/*" id="fileBg">
+          <input type="file" accept="image/*,video/mp4,video/webm,video/quicktime,.mp4,.webm,.mov,.m4v" id="fileBg">
           <span class="drop-num">1</span>
-          <span class="drop-text"><b>背景</b><span>风景、房间、街道都行；也可以是 GIF 动图</span></span>
+          <span class="drop-text"><b>背景</b><span>风景、房间、街道都行；也可以是 GIF 或短视频</span></span>
           <img class="thumb" id="thumbBg" alt="">
         </label>
         <label class="drop" id="dropCh">
-          <input type="file" accept="image/*" id="fileCh">
+          <input type="file" accept="image/*,video/mp4,video/webm,video/quicktime,.mp4,.webm,.mov,.m4v" id="fileCh">
           <span class="drop-num">2</span>
-          <span class="drop-text"><b>人物</b><span>透明底 PNG 最好；白底、纯色底会自动抠掉；GIF 动图也行</span></span>
+          <span class="drop-text"><b>人物</b><span>透明底 PNG 最好；白底、纯色底会自动抠掉；GIF、短视频也行</span></span>
           <img class="thumb" id="thumbCh" alt="">
         </label>
         <button class="ghost wide" id="loadDemo">换回示例图</button>
         <ul class="tips">
           <li>人物图的底越接近纯色，抠得越干净。带白描边的贴纸，到「人物」页打开「去贴纸白边」。</li>
           <li>挑背景时先想一下光从哪来、人物站在哪。人物原画是室内暗光，硬放进正午草地，怎么调都会别扭。</li>
-          <li>人物或背景是 GIF 动图时，画面会动起来，导出也是 GIF。动图太大会自动缩小，导出最长边 960 像素（手机 720）。</li>
+          <li>人物或背景是 GIF 或视频（MP4 / WebM / MOV，最长取 20 秒）时，画面会动起来，导出是 GIF。纯色底的视频人物会自动抠底，还会去掉鼠标指针这类零碎小块。动图太大会自动缩小，导出最长边 960 像素（手机 720）。</li>
           <li>电脑上可以直接 Ctrl/⌘+V 粘贴图片当人物，也可以把图拖进画面。</li>
           <li>默认是简单模式，只留最常用的几项。要细调，点右上角「高级」。</li>
         </ul>
@@ -100,13 +100,13 @@
     <li><b>找光源、打光</b>：在背景里找最亮的一片当光源，也可以自己拖。按人物轮廓估出一个「鼓起来」的立体形状，算出哪边迎光、哪边背光，再在迎光的边缘加轮廓光。</li>
     <li><b>融边缘</b>：人物边缘透进一点身后模糊的背景（光包裹）；贴着人物压一圈很淡的暗晕；打开投影的话，影子会顺着光的反方向倒在地上。</li>
     <li><b>更融一点</b>：脚下那一截把背景里的亮细节（草叶、花）盖到人物前面；下半身和边缘起一层薄雾；从光源散出几道光束。</li>
-    <li><b>动图</b>：GIF 每一帧都单独抠图、打光、合成；所有帧共用一个裁切框，人物不会抖。导出时整段动画共用一套 255 色调色板，用固定的网点抖动，静止的地方每帧都一样，只记录变化的区域，文件更小。</li>
+    <li><b>动图</b>：视频会按每秒 5–20 帧抽帧（帧间隔取整到 GIF 能存的 1/100 秒）。GIF 和视频的每一帧都单独抠图、打光、合成；所有帧共用一个裁切框，人物不会抖。导出时整段动画共用一套 255 色调色板，用固定的网点抖动，静止的地方每帧都一样，只记录变化的区域，文件更小。</li>
     <li><b>统一调色</b>：合成之后整张图再一起过曝光、色温、对比、褪色、分离色调、柔光、暗角和颗粒。几种风格就是这几组参数的预设。</li>
   </ol>
   <p class="small">「贴纸原样」和「融图后」可以来回切。「看明暗」把画面变成黑白，「看颜色」把明暗抹平只留颜色，用来检查人物和背景的亮度、色调是不是对上了。</p>
 </section>
 <footer class="foot">溶光 · 免费在线工具 · 生成的图归你</footer>
-<script src="gif.js?v=2"></script>
-<script src="app.js?v=2"></script>
+<script src="gif.js?v=3"></script>
+<script src="app.js?v=3"></script>
 </body>
 </html>

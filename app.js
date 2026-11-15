@@ -1173,13 +1173,20 @@ const MAX_VIDEO_SECS = 20;
 async function loadVideo(file, kind) {
   const url = URL.createObjectURL(file);
   const v = document.createElement('video');
-  v.muted = true; v.playsInline = true; v.preload = 'auto'; v.src = url;
+  v.muted = true; v.defaultMuted = true; v.playsInline = true; v.preload = 'auto';
+  v.setAttribute('muted', ''); v.setAttribute('playsinline', '');
+  v.src = url;
   try {
+    // iOS Safari does not load data until load()/play() is called, so wait on metadata with a timeout
     await new Promise((res, rej) => {
-      v.onloadeddata = res;
-      v.onerror = () => rej(new Error('这个视频读不出来。换成 MP4（H.264）或 WebM 试试'));
+      const to = setTimeout(() => rej(new Error('视频加载超时。换成 MP4（H.264）试试，或者先转成 GIF')), 15000);
+      const ok = () => { clearTimeout(to); res(); };
+      v.addEventListener('loadedmetadata', ok, { once: true });
+      v.addEventListener('error', () => { clearTimeout(to); rej(new Error('这个视频读不出来。换成 MP4（H.264）或 WebM 试试')); }, { once: true });
+      v.load();
     });
     try { await v.play(); v.pause(); } catch (e) { /* autoplay blocked: seeking still works */ }
+    if (v.readyState < 2) await new Promise(r => { const to = setTimeout(r, 3000); v.addEventListener('loadeddata', () => { clearTimeout(to); r(); }, { once: true }); });
     const full = v.duration;
     if (!isFinite(full) || full <= 0) throw new Error('读不到视频长度');
     const dur = Math.min(full, MAX_VIDEO_SECS), w = v.videoWidth, h = v.videoHeight;
